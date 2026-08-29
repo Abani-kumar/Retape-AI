@@ -33,9 +33,6 @@ class Client:
 @dataclass
 class Offer:
     creditor: str
-    # NOTE: renamed from `current_balance_cents` per ASSIGNMENT.md's
-    # "Note on a renamed field" -- the client keeps current_balance_cents
-    # (the SDA balance); the offer's field is the creditor's balance.
     creditor_balance_cents: int
     original_balance_cents: int
     settlement_pct: float
