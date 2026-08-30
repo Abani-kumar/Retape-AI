@@ -111,12 +111,12 @@ def test_even_shape_invalid_distribution(base_rules):
 def test_staircase_shape_generation(base_rules):
     base_rules.max_segments = 2
     # 4 payments, 25000 total, base min 2500.
-    # Staircase partition should put more items in early levels and fewer in late levels
-    # Size division: 4/2 = 2 each. Sizes: [2, 2]
-    # Level 1 = 2500 (min), so 2500 * 2 = 5000
-    # Level 2 = (25000 - 5000) / 2 = 10000
+    # Staircase partition V2: last segment is always size 1.
+    # Front segments split remaining k-1 (3) payments.
+    # Level 1 = 2500 for 3 payments = 7500.
+    # Level 2 = 25000 - 7500 = 17500 for 1 payment.
     seq = _BUILDERS["staircase"](4, 25000, base_rules)
-    assert seq == [2500, 2500, 10000, 10000]
+    assert seq == [2500, 2500, 2500, 17500]
 
 def test_balloon_shape_generation(base_rules):
     base_rules.is_ballooning_allowed = True

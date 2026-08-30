@@ -205,18 +205,50 @@ def build_staircase(k: int, offer_total: int, rules: CreditorRules) -> list[int]
     """Front-loaded partition into <= max_segments flat levels: earlier
     groups get MORE positions at a LOW level, the tail group gets FEWER
     positions at a HIGH level, concentrating $ value late. One defensible
-    interpretation among several -- document this choice in the README."""
+    interpretation among several -- document this choice in the README.
+
+    The LAST payment is always a single absorbing position (never a flat
+    group of size > 1). A single payment can be any amount, so there is no
+    "does the remainder divide evenly" arithmetic to fail on -- that was a
+    self-inflicted brittleness in the previous version, not a real
+    constraint from the spec. If the richest segment count still can't
+    produce a non-decreasing sequence (the front groups, already at their
+    tightest legal minimum, leave too little for the last position), we
+    retry with fewer segments before concluding this k is genuinely
+    infeasible for a staircase -- one rigid partition failing doesn't mean
+    no legal staircase exists for this k.
+    """
     if k <= 0:
         return None
-    s = max(1, min(rules.max_segments, k))
-    base_size, rem = divmod(k, s)
-    sizes = [base_size + (1 if i < rem else 0) for i in range(s)]
+    max_s = max(1, min(rules.max_segments, k))
+    for s in range(max_s, 0, -1):
+        seq = _staircase_with_segments(k, offer_total, rules, s)
+        if seq is not None:
+            return seq
+    return None
+
+
+def _staircase_with_segments(k: int, offer_total: int, rules: CreditorRules, s: int) -> list[int] | None:
+    if s <= 1:
+        # No absorbing last position available -- every payment must be
+        # literally identical. This is the one case where a remainder is a
+        # genuine failure, not an artifact: with a single segment there is
+        # no second value to push a leftover cent onto.
+        if offer_total % k != 0:
+            return None
+        level = offer_total // k
+        return [level] * k
+
+    front_count = k - 1
+    front_segments = s - 1
+    base_size, rem = divmod(front_count, front_segments)
+    sizes = [base_size + (1 if i < rem else 0) for i in range(front_segments)]
     sizes.sort(reverse=True)  # larger groups first (front-loaded count)
 
     levels: list[int] = []
     idx = 1
     consumed = 0
-    for size in sizes[:-1]:
+    for size in sizes:
         block_last = idx + size - 1
         level = max(tier_floor(p, rules) for p in range(idx, block_last + 1))
         if levels and level < levels[-1]:
@@ -225,18 +257,15 @@ def build_staircase(k: int, offer_total: int, rules: CreditorRules) -> list[int]
         consumed += level * size
         idx += size
 
-    last_size = sizes[-1]
-    remaining = offer_total - consumed
-    if last_size <= 0 or remaining % last_size != 0:
-        return None
-    last_level = remaining // last_size
-    if levels and last_level < levels[-1]:
-        return None
-    levels.append(last_level)
+    last_payment = offer_total - consumed
+    if last_payment < levels[-1] or last_payment < tier_floor(k, rules):
+        return None  # front groups are already at their legal minimum --
+                     # this segment count genuinely doesn't fit this k
 
     seq: list[int] = []
     for level, size in zip(levels, sizes):
         seq.extend([level] * size)
+    seq.append(last_payment)
     return seq
 
 
@@ -374,6 +403,7 @@ def frontload_fee(
         running = min(running, profile_at[cadence[i]])
         suffix_min[i] = running
 
+    # fee taken so far
     committed = 0
     plan: dict[date, int] = {}
     for i, d in enumerate(cadence):
@@ -438,7 +468,7 @@ def find_best_candidate(client: Client, offer: Offer, rules: CreditorRules,
     best_key = None
     for k in range(1, max_k + 1):
         if sum(minimal_nondecreasing(k, rules)) > offer_total:
-            continue  # cheap lower-bound rejection only
+            break  # change to break instead as more months means more money which definitely means failure
         cand = _try_k(k, cadence, offer_total, fee_total, client, rules)
         if cand is None:
             continue
@@ -515,7 +545,7 @@ def _client_with_lump(client: Client, d: date, amount: int) -> Client:
     return replace(client, ledger=new_ledger)
 
 
-def _client_with_increment(client: Client, x: int) -> Client:
+def   _client_with_increment(client: Client, x: int) -> Client:
     new_ledger = [
         LedgerEntry(e.date, e.amount_cents + x, e.type)
         if e.type == "credit" and e.date > client.as_of_date
@@ -562,11 +592,20 @@ def compute_additional_funds(client: Client, offer: Offer, rules: CreditorRules)
             monthly_increment=FundsOption(amount_cents=0, within_guardrail=False, reason=reason, num_drafts=0),
         )
 
+    # 1. Setting the limits for the Binary Search and Business Guardrails
+    # We will never ask the client to deposit more than the entire cost of the settlement.
     cap = max(offer_total + fee_total, 1)
+
+    # Business rule: Lump sum should not exceed 65% of the total debt
     lump_guardrail = round_half_up(0.65 * offer_total)
+
+    # Business rule: Monthly increase should not exceed 40% of their current deposit (min $100)
     incr_guardrail = max(10_000, round_half_up(0.40 * client.draft_amount_cents))
+
     lump_date = _lump_date(client)
 
+    # 2. The Lump Sum Binary Search
+    # Binary searches between 0 and `cap` to find the exact minimum penny needed to make the settlement feasible
     lump = _binary_search_min(
         lambda x: _is_feasible_with(_client_with_lump(client, lump_date, x), offer, rules), 0, cap
     )
@@ -577,6 +616,7 @@ def compute_additional_funds(client: Client, offer: Offer, rules: CreditorRules)
             date=lump_date,
         )
     else:
+        # If successful, package it into FundsOption and check against the 65% guardrail
         lump_option = FundsOption(
             amount_cents=lump, within_guardrail=lump <= lump_guardrail,
             reason="" if lump <= lump_guardrail
@@ -584,12 +624,15 @@ def compute_additional_funds(client: Client, offer: Offer, rules: CreditorRules)
             date=lump_date,
         )
 
+    # 3. The Monthly Increment Option
     n_future = _future_draft_count(client)
     if n_future == 0:
+        # If the client has no scheduled deposits left, they cannot increase their monthly deposit.
         incr_option = FundsOption(
             amount_cents=0, within_guardrail=False, reason="no future drafts exist to increase.", num_drafts=0,
         )
     else:
+        # Binary searches to find the exact minimum monthly increase needed
         incr = _binary_search_min(
             lambda x: _is_feasible_with(_client_with_increment(client, x), offer, rules), 0, cap
         )
@@ -600,6 +643,7 @@ def compute_additional_funds(client: Client, offer: Offer, rules: CreditorRules)
                 num_drafts=n_future,
             )
         else:
+            # If successful, package it into FundsOption and check against the 40% guardrail
             incr_option = FundsOption(
                 amount_cents=incr, within_guardrail=incr <= incr_guardrail,
                 reason="" if incr <= incr_guardrail
